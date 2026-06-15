@@ -1,0 +1,9 @@
+[Unit]
+Description=Triggert das Komodo-Backup jede Nacht um 02:00 Uhr
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

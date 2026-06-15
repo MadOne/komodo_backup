@@ -1,0 +1,8 @@
+# Block configuration secrets entirely
+*.env
+secrets/
+
+# Block execution artifacts
+*.log
+.snapshots/
+__pycache__/

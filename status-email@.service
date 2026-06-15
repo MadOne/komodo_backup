@@ -1,0 +1,6 @@
+[Unit]
+Description=Sendet eine E-Mail bei Service-Fehlern
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/systemd-email.sh %i

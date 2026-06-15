@@ -1,0 +1,12 @@
+[Unit]
+Description=Komodo Container Stopp und Restic Btrfs Backup
+After=network.target
+OnFailure=status-email@%n.service
+
+[Service]
+Type=oneshot
+
+ExecStart=/usr/local/bin/komodo-backup.py
+
+[Install]
+WantedBy=multi-user.target
