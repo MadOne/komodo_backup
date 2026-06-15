@@ -36,9 +36,10 @@ logging.basicConfig(
     ]
 )
 
-# Generate snapshot execution timestamp
+# Define paths based on your specific order of operations
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-snapshot_path = f"{SNAPSHOT_DIR}/backup_snap_{timestamp}"
+timed_snapshot_path = f"{SNAPSHOT_DIR}/backup_snap_{timestamp}"
+processing_path = f"{SNAPSHOT_DIR}/processing"
 
 
 def load_env_file(filepath):
@@ -56,7 +57,6 @@ def load_env_file(filepath):
                     continue
                 if "=" in line:
                     key, value = line.split("=", 1)
-                    # Strip spaces and optional wrapping quotes
                     env_vars[key.strip()] = value.strip().strip('"').strip("'")
         logging.info(f"Successfully loaded external environment properties from {filepath}.")
     except Exception as e:
@@ -68,25 +68,31 @@ def load_env_file(filepath):
 def run_command(cmd, check=True, cwd=None, preexec_fn=None, extra_env=None):
     """Executes a system process, passing down inherited and loaded environment schemas."""
     logging.info(f"Executing command: {' '.join(cmd)}")
-    
-    # Copy host system environment base
     current_env = os.environ.copy()
-    
-    # Inject loaded configuration credentials dynamically
     if extra_env:
         current_env.update(extra_env)
-    
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd, env=current_env, preexec_fn=preexec_fn
-    )
+        
+    is_restic_backup = len(cmd) > 1 and "restic" in cmd[0] and "backup" in cmd[1]
+
+    if is_restic_backup:
+        result = subprocess.run(
+            cmd, capture_output=False, stdout=None, stderr=subprocess.PIPE, text=True, cwd=cwd, env=current_env, preexec_fn=preexec_fn
+        )
+        stdout_output = "[Restic streamed directly to terminal output]"
+    else:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, env=current_env, preexec_fn=preexec_fn
+        )
+        stdout_output = result.stdout
+
     if check and result.returncode != 0:
         logging.error(f"ERROR executing command: {' '.join(cmd)}")
         if result.stderr:
             logging.error(f"Command stderr output: {result.stderr.strip()}")
         raise subprocess.CalledProcessError(
-            result.returncode, cmd, output=result.stdout, stderr=result.stderr
+            result.returncode, cmd, output=stdout_output, stderr=result.stderr
         )
-    return result.stdout
+    return stdout_output
 
 
 def get_running_stacks_from_docker(config_env):
@@ -105,10 +111,7 @@ def get_running_stacks_from_docker(config_env):
 def set_low_priority():
     """Forces the spawned child process into low scheduling bands directly during kernel fork."""
     import os
-    # Minimize CPU priority allocation (19 = lowest scheduling priority)
     os.nice(19)
-    
-    # Direct x86_64 system call (251 = __NR_ioprio_set) forcing IO class 3 (Idle)
     try:
         import ctypes
         libc = ctypes.CDLL(None)
@@ -119,11 +122,8 @@ def set_low_priority():
 
 def main():
     logging.info("=== Komodo/Restic Snapshot Backup Task Initiated ===")
-    
-    # Explicitly load runtime properties from local secrets vault
     config_env = load_env_file(ENV_FILE_PATH)
     
-    # Extract keys safely for internal API processing
     komodo_key = config_env.get("KOMODO_KEY")
     komodo_secret = config_env.get("KOMODO_SECRET")
     
@@ -182,10 +182,18 @@ def main():
         if not success:
             raise RuntimeError("TIMEOUT: Production infrastructure stacks failed to halt cleanly. Terminating sequence!")
 
-        # 4. Generate Btrfs Read-Only atomic filesystem snapshot freeze
-        logging.info("Freezing subvolume state using atomic Btrfs read-only snapshot...")
+        # 4. Clear old stale structures before mounting to avoid naming collisions
+        if os.path.exists(processing_path):
+            logging.warning("Found stale processing subvolume from an old run. Cleaning up...")
+            run_command(["btrfs", "subvolume", "delete", processing_path], extra_env=config_env)
+
+        # 5. STEP ONE: Create the immutable atomic backup with the unique timestamp
+        logging.info(f"Freezing subvolume state into timed target: {timed_snapshot_path}")
         run_command(["mkdir", "-p", SNAPSHOT_DIR], extra_env=config_env)
-        run_command(["btrfs", "subvolume", "snapshot", "-r", LIVE_SUBVOLUME, snapshot_path], extra_env=config_env)
+        run_command(["btrfs", "subvolume", "snapshot", "-r", LIVE_SUBVOLUME, timed_snapshot_path], extra_env=config_env)
+
+        # (OPTIONAL HOOK): If you want to sync this snapshot to your local HDD array later, 
+        # you can safely read from `timed_snapshot_path` right here while the stacks are down.
 
     except requests.exceptions.HTTPError as http_err:
         logging.error(f"API EXCEPTION: Komodo endpoint rejected transaction: {http_err}")
@@ -194,7 +202,7 @@ def main():
         logging.error(f"CRITICAL PROCESS INTERRUPTION during lifecycle loop: {e}")
         raise
     finally:
-        # 5. Recovery Rollback Block: Reinitialize only instances intentionally degraded
+        # 6. Recovery Rollback Block: Bring your container core back online safely
         if stopped_stacks:
             logging.info("=== Restoring container infrastructure runtime profiles via Komodo API ===")
             for stack_name in stopped_stacks:
@@ -213,13 +221,19 @@ def main():
         else:
             logging.info("No container infrastructure modifications recorded. Recovery cycle bypassed.")
 
-    # 6. Restic Offsite Payload Sync (Safely executed outside core stack downtime window)
-    logging.info("=== Maintenance downtime concluded. Initiating background Restic transfer ===")
+    # 7. STEP TWO: Transition path variables dynamically for Restic parental indexing
+    logging.info("=== Maintenance downtime concluded. Preparing offsite backup paths ===")
     try:
-        # Runs natively passing parsed configuration variables while bound to low-priority hooks
+        if os.path.exists(timed_snapshot_path):
+            logging.info(f"Renaming historical snapshot {timed_snapshot_path} -> {processing_path}")
+            # Btrfs moves paths instantly at the metadata level with zero performance overhead
+            run_command(["mv", timed_snapshot_path, processing_path], extra_env=config_env)
+        else:
+            raise FileNotFoundError(f"Expected snapshot was missing at {timed_snapshot_path}!")
+
+        # 8. Dispatch offsite backup against the static tracker path
         run_command(
-            ["/usr/bin/restic", "backup", "--tag", "config-backup", "."], 
-            cwd=snapshot_path,
+            ["restic", "backup", "--tag", "config-backup", "--verbose=1", processing_path], 
             preexec_fn=set_low_priority,
             extra_env=config_env
         )
@@ -228,9 +242,14 @@ def main():
         logging.error(f"Restic synchronization lifecycle failed: {restic_error}")
         raise
     finally:
-        # Always purge transient local storage structures to maintain flat volume layers
-        logging.info("Purging transient local Btrfs backup snapshot allocation...")
-        run_command(["btrfs", "subvolume", "delete", snapshot_path], check=False, extra_env=config_env)
+        # 9. STEP THREE: Clean up the temporary processing volume space
+        if os.path.exists(processing_path):
+            logging.info("Purging temporary processing Btrfs subvolume allocation...")
+            run_command(["btrfs", "subvolume", "delete", processing_path], check=False, extra_env=config_env)
+        elif os.path.exists(timed_snapshot_path):
+            # Fallback cleanup check if the rename failed or was bypassed
+            logging.info("Purging remaining timestamped snapshot structure...")
+            run_command(["btrfs", "subvolume", "delete", timed_snapshot_path], check=False, extra_env=config_env)
 
     logging.info("=== Backup Operations Completed Successfully ===")
 
