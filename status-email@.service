@@ -1,6 +1,8 @@
 [Unit]
-Description=Sendet eine E-Mail bei Service-Fehlern
+Description=Systemd Status Email Failure Notification Multiplexer for %i
 
 [Service]
 Type=oneshot
+# Executes the shell script, passing only the failing service name as an argument
 ExecStart=/usr/local/bin/systemd-email.sh %i
+User=root
